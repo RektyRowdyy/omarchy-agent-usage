@@ -297,7 +297,12 @@ Item {
   property bool syncRunning: false
   property bool syncRequestedWhileRunning: false
   property string syncStatusText: ""
-  property double aggregateUpdatedAtMs: aggregateData && aggregateData.updatedAtMs ? Number(aggregateData.updatedAtMs) : 0
+  // Scan limits for syncDir. A snapshot is a few KB, so these leave plenty
+  // of headroom for many machines while keeping the shell's memory bounded.
+  readonly property int syncMaxFiles: 64
+  readonly property int syncMaxFileBytes: 512 * 1024
+  readonly property int syncMaxTotalBytes: 4 * 1024 * 1024
+  property double aggregateUpdatedAtMs:aggregateData && aggregateData.updatedAtMs ? Number(aggregateData.updatedAtMs) : 0
 
   onSyncEnabledChanged: syncSettingsChanged()
   onSyncDirChanged: syncSettingsChanged()
@@ -419,8 +424,24 @@ Item {
       finishSyncRun()
       return
     }
-    var script = "dir=$0; [[ -d \"$dir\" ]] || exit 0; shopt -s nullglob; for f in \"$dir\"/*.json; do [[ -f \"$f\" ]] || continue; printf '===%s===\\n' \"$f\"; cat \"$f\"; printf '\\n=== EOM ===\\n'; done"
-    syncScanProcess.command = ["bash", "-c", script, root.syncEffectiveDir]
+    // Newest regular files first (symlinks are skipped), with caps on file
+    // count, per-file size and total bytes so a flooded or oversized sync
+    // folder can't balloon the collector. head -c guards files that grow
+    // after the size check; a truncated snapshot just fails to parse.
+    var script = [
+      "dir=$1; maxFiles=$2; maxFileBytes=$3; maxTotalBytes=$4",
+      "[[ -d \"$dir\" ]] || exit 0",
+      "count=0; total=0",
+      "while IFS=$'\\t' read -r -d '' _ size f; do",
+      "  if (( count >= maxFiles )); then echo \"skipping remaining snapshots: more than $maxFiles files\" >&2; break; fi",
+      "  if (( size > maxFileBytes )); then echo \"skipping oversized snapshot $f ($size bytes)\" >&2; continue; fi",
+      "  if (( total + size > maxTotalBytes )); then echo \"skipping remaining snapshots: over $maxTotalBytes bytes\" >&2; break; fi",
+      "  count=$((count + 1)); total=$((total + size))",
+      "  printf '===%s===\\n' \"$f\"; head -c \"$maxFileBytes\" -- \"$f\"; printf '\\n=== EOM ===\\n'",
+      "done < <(find \"$dir\" -maxdepth 1 -type f -name '*.json' -printf '%T@\\t%s\\t%p\\0' | sort -z -r -n)"
+    ].join("\n")
+    syncScanProcess.command = ["bash", "-c", script, "agents-sync-scan", root.syncEffectiveDir,
+                               String(root.syncMaxFiles), String(root.syncMaxFileBytes), String(root.syncMaxTotalBytes)]
     syncScanProcess.running = true
   }
 
@@ -459,7 +480,15 @@ Item {
   }
 
   function parseSyncScanOutput(output) {
-    var lines = String(output || "").split("\n")
+    var text = String(output || "")
+    // The scan already caps its output; this only catches a misbehaving
+    // script before split/JSON.parse multiply the memory cost.
+    if (text.length > root.syncMaxTotalBytes + root.syncMaxFiles * 4096) {
+      console.warn("agents/sync", "Ignoring oversized sync scan output", text.length)
+      syncStatusText = "Usage sync output too large"
+      return
+    }
+    var lines = text.split("\n")
     var snapshots = []
     var currentPath = ""
     var currentJson = []

@@ -123,8 +123,10 @@ process**, with your own user's permissions. What this one does with them:
   These are exactly the calls the built-in `omarchy.agents` widget already
   makes. The plugin adds no network requests of its own.
 - **Reading records.** It lists that directory with `find` and watches the
-  records. With `syncMode` on, it reads `/etc/hostname` and reads every
-  `*.json` in `syncDir` (via `bash -c` + `cat`).
+  records. With `syncMode` on, it reads `/etc/hostname` and reads the
+  `*.json` files in `syncDir` (via `bash -c` + `find` + `head`), newest
+  first, capped at 64 files, 512 KiB per file and 4 MiB in total. Symlinks
+  and larger files are skipped.
 - **Writing files.** Only when `syncMode` is on: it creates `syncDir`
   (`mkdir -p`) and writes one snapshot file there. That file contains token
   counts, dates and model names, never credentials. Toggling the bar view
